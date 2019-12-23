@@ -5,6 +5,7 @@ This is the code repository of the paper ["Spatial Mixture Models with Learnable
 ### Dependencies
 
 - pytorch == 1.0
+- torchvision == 0.2
 - numpy >= 1.15
 - h5py >= 2.8
 - scipy >= 1.1
@@ -23,7 +24,7 @@ cd ..
 
 ### Experiments
 
-Change the current working directory to `experiments` and run `run.sh` (replace `use_pretrained=1` in line 6 with `use_pretrained=0` if not using the pretrained models).
+Change the current working directory to `experiments` and run `run.sh`.
 
 ```bash
 cd experiments
@@ -31,8 +32,4 @@ cd experiments
 cd ..
 ```
 
-Run `experiments/evaluate.ipynb` to compute AMI and MSE scores (averaged over 5 runs), and plot results.
-
-### Some Implementation Details
-
-Some implementation details are described in `some_details.ipynb`.
+Run `experiments/evaluate.ipynb` to evaluate the trained models.
