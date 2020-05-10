@@ -1,16 +1,17 @@
-## Spatial Mixture Models with Learnable Deep Priors for Perceptual Grouping
+## Spatial Mixture Models with Learnable Deep Priors (SMMLDP)
 
 This is the code repository of the paper ["Spatial Mixture Models with Learnable Deep Priors for Perceptual Grouping"](https://arxiv.org/abs/1902.02502).
 
 ### Dependencies
 
-- pytorch == 1.0
-- torchvision == 0.2
-- numpy >= 1.15
-- h5py >= 2.8
-- scipy >= 1.1
-- scikit-learn == 0.19
-- matplotlib >= 2.2
+- pytorch == 1.4
+- torchvision == 0.5
+- numpy == 1.18
+- h5py == 2.8
+- pyyaml == 5.3
+- scipy == 1.4
+- scikit-learn == 0.22
+- tensorboard == 2.1
 
 ### Datasets
 

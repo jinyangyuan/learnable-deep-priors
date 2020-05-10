@@ -1,67 +1,60 @@
-path_data: null
-folder: null
-train: null
+summ_scalar_intvl: 1
+summ_image_intvl: 1
+summ_image_count: 10
 
-gaussian_std: 0.25
+normal_scale: 0.25
 noise_prob: 0.2
 lr: 1.0e-3
-max_objects: 3
 batch_size: 64
 num_workers: 1
 num_epochs: 50
-num_steps: 5
 num_tests: 5
+num_slots: 4
+num_steps: 5
+step_wt: null
 
-coef_param_dict:
-    back_prior:
-        epochs: [25]
-        values: [1.0, 0.0, 0.0]
-        linears: [1, 1]
-    back_diff:
-        epochs: []
-        values: [1.0, 1.0]
-        linears: [1]
-    apc_diff:
-        epochs: []
-        values: [1.0, 1.0]
-        linears: [1]
+loss_coef:
+  bck_prior:
+    epoch: [25]
+    value: [1.0, 0.0, 0.0]
+    linear: [true, true]
+  bck_var:
+    epoch: []
+    value: [1.0, 1.0]
+    linear: [true]
+  apc_var:
+    epoch: []
+    value: [1.0, 1.0]
+    linear: [true]
 
-state_main_size: 128
-state_back_size: 8
+state_bck_size: 8
 state_obj_size: 16
 
-init_back_channel_list: [32, 64]
-init_back_kernel_list: [4, 4]
-init_back_stride_list: [2, 2]
-init_back_hidden_list: []
-init_back_size: 16
+init_bck_channel: [32, 64]
+init_bck_kernel: [4, 4]
+init_bck_stride: [2, 2]
+init_bck_hidden: [16]
 
-init_obj_channel_list: [32, 64]
-init_obj_kernel_list: [4, 4]
-init_obj_stride_list: [2, 2]
-init_obj_main_hidden_list: []
-init_obj_main_size: 256
-init_obj_obj_hidden_list: [64]
-init_obj_obj_size: 32
+init_upd_channel: [32, 64]
+init_upd_kernel: [4, 4]
+init_upd_stride: [2, 2]
+init_upd_hidden: [128]
+init_upd_state: 64
+init_obj_hidden: [32]
 
-upd_back_color_hidden_list: [8, 8]
-upd_back_diff_channel_list: [32, 64]
-upd_back_diff_kernel_list: [4, 4]
-upd_back_diff_stride_list: [2, 2]
-upd_back_diff_hidden_list: [8]
+dec_bck_avg_hidden_rev: [16]
+dec_bck_res_channel_rev: [8, 16]
+dec_bck_res_kernel_rev: [4, 4]
+dec_bck_res_stride_rev: [2, 2]
+dec_bck_res_hidden_rev: [16]
 
-upd_apc_color_hidden_list: [8, 8]
-upd_apc_diff_channel_list: [32, 64]
-upd_apc_diff_kernel_list: [4, 4]
-upd_apc_diff_stride_list: [2, 2]
-upd_apc_diff_hidden_list: [8]
-upd_shp_channel_list: [32, 64]
-upd_shp_kernel_list: [4, 4]
-upd_shp_stride_list: [2, 2]
-upd_shp_hidden_list: [16]
+dec_apc_avg_hidden_rev: [16]
+dec_apc_res_channel_rev: [8, 16]
+dec_apc_res_kernel_rev: [4, 4]
+dec_apc_res_stride_rev: [2, 2]
+dec_apc_res_hidden_rev: [16]
 
-file_args: args.yaml
-file_log: train.log
-file_model: model.pth
-file_result_base: result_{}.h5
-loss_weights: null
+dec_shp_channel_rev: [32, 64]
+dec_shp_kernel_rev: [4, 4]
+dec_shp_stride_rev: [2, 2]
+dec_shp_hidden_rev: [16]
