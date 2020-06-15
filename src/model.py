@@ -10,10 +10,8 @@ class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
         # Hyperparameters
-        self.obj_slots = config['num_slots'] - 1
-        self.num_steps = config['num_steps']
-        self.noise_prob = config['noise_prob']
-        self.normal_invvar = 1 / pow(config['normal_scale'], 2)
+        self.normal_scale = config['normal_scale']
+        self.normal_invvar = 1 / pow(self.normal_scale, 2)
         self.normal_const = math.log(2 * math.pi / self.normal_invvar)
         self.seg_bck = config['seg_bck']
         # Neural networks
@@ -24,59 +22,51 @@ class Model(nn.Module):
         self.dec_bck = DecoderBck(config)
         self.dec_obj = DecoderObj(config)
 
-    def forward(self, images, labels, step_wt):
-        ###################
-        # Initializations #
-        ###################
-        # Background
+    def forward(self, images, labels, num_slots, num_steps, step_wt):
+        # Initializations
+        obj_slots = num_slots - 1
         states_bck = self.init_bck(images)
         result_bck = self.dec_bck(states_bck[0])
-        # Objects
         result_obj = {
             'apc': torch.zeros([0, *images.shape], device=images.device),
-            'apc_res': torch.zeros([0, *images.shape], device=images.device),
             'shp': torch.zeros([0, images.shape[0], 1, *images.shape[2:]], device=images.device),
             'logits_shp': torch.zeros([0, images.shape[0], 1, *images.shape[2:]], device=images.device),
         }
-        states_main, states_obj = None, None
-        for _ in range(self.obj_slots):
-            init_obj_inputs = self.compute_init_obj_in(images, result_bck, result_obj)
-            sub_states_obj, states_main = self.init_obj(init_obj_inputs, states_main)
-            states_obj = self.initialize_storage(result_obj, states_obj, sub_states_obj)
+        states_main = None
+        states_obj_list = []
+        for _ in range(obj_slots):
+            indices = self.compute_indices(images, result_obj)
+            perm_vals = {key: self.permute(result_obj[key], indices) for key in ['apc', 'shp']}
+            mask = self.compute_mask(perm_vals['shp'])
+            recon = (mask * torch.cat([perm_vals['apc'], result_bck['bck'][None]])).sum(0)
+            init_obj_in = torch.cat([images, recon, mask[-1]], dim=1).detach()
+            states_obj, states_main = self.init_obj(init_obj_in, states_main)
+            update_dict = self.dec_obj(states_obj[0], obj_slots=1)
+            for key, val in result_obj.items():
+                result_obj[key] = torch.cat([val, update_dict[key]])
+            states_obj_list.append(states_obj)
+        states_obj = tuple([torch.cat(n) for n in zip(*states_obj_list)])
         states_obj = self.adjust_order(images, result_obj, states_obj)
-        # Losses
         result_prob = self.compute_probabilities(images, result_bck, result_obj)
-        step_losses = self.compute_step_losses(images, result_bck, result_obj, result_prob)
+        step_losses = self.compute_step_losses(images, result_bck, result_prob)
         losses = {key: [val] for key, val in step_losses.items()}
-        ###############
-        # Refinements #
-        ###############
-        for _ in range(self.num_steps):
-            # Add noises to images
-            noisy_images = self.add_noise(images)
-            # Compute inputs of the hidden states updaters
-            upd_bck_in, upd_apc_in, upd_shp_in = self.compute_upd_in(noisy_images, result_bck, result_obj, result_prob)
-            # Update hidden states
+        # Refinements
+        for _ in range(num_steps):
+            noisy_images = images + torch.randn_like(images) * self.normal_scale
+            gamma = result_prob['gamma']
+            upd_bck_in = gamma[-1] * (noisy_images - result_bck['bck'])
+            upd_apc_in = gamma[:-1] * (noisy_images[None] - result_obj['apc'])
+            upd_shp_in = gamma[:-1] * (1 - result_obj['shp']) - (1 - gamma[:-1].cumsum(0)) * result_obj['shp']
             states_bck = self.upd_bck(upd_bck_in, states_bck)
             states_obj = self.upd_obj(upd_apc_in, upd_shp_in, states_obj)
-            # Decode
             result_bck = self.dec_bck(states_bck[0])
-            result_obj = self.dec_obj(states_obj[0], obj_slots=self.obj_slots)
-            # Adjust order
+            result_obj = self.dec_obj(states_obj[0], obj_slots)
             states_obj = self.adjust_order(images, result_obj, states_obj)
-            # Losses
             result_prob = self.compute_probabilities(images, result_bck, result_obj)
-            step_losses = self.compute_step_losses(images, result_bck, result_obj, result_prob)
+            step_losses = self.compute_step_losses(images, result_bck, result_prob)
             for key, val in step_losses.items():
                 losses[key].append(val)
-        ###########
-        # Outputs #
-        ###########
-        # Losses
-        sum_step_wt = step_wt.sum(1)
-        losses = {key: torch.stack([loss for loss in val], dim=1) for key, val in losses.items()}
-        losses = {key: (step_wt * val).sum(1) / sum_step_wt for key, val in losses.items()}
-        # Results
+        # Outputs
         apc_all = torch.cat([result_obj['apc'], result_bck['bck'][None]]).transpose(0, 1)
         shp = result_obj['shp']
         shp_all = torch.cat([shp, torch.ones([1, *shp.shape[1:]], device=shp.device)]).transpose(0, 1)
@@ -89,29 +79,25 @@ class Model(nn.Module):
         mask_oh_all.scatter_(1, segment_all, 1)
         mask_oh_obj.scatter_(1, segment_obj, 1)
         pres_all = mask_oh_all.reshape(*mask_oh_all.shape[:-3], -1).max(-1).values
-        pres = mask_oh_obj.reshape(*mask_oh_obj.shape[:-3], -1).max(-1).values
+        pres = pres_all[:, :-1]
         results = {'apc': apc_all, 'shp': shp_all, 'pres': pres_all, 'recon': recon, 'mask': mask,
                    'segment_all': segment_all, 'segment_obj': segment_obj}
-        # Metrics
         metrics = self.compute_metrics(images, labels, pres, mask_oh_all, mask_oh_obj, recon, result_prob['log_prob'])
+        sum_step_wt = step_wt.sum(1)
+        losses = {key: torch.stack([loss for loss in val], dim=1) for key, val in losses.items()}
+        losses = {key: (step_wt * val).sum(1) / sum_step_wt for key, val in losses.items()}
         losses['compare'] = -metrics['ll']
         return results, metrics, losses
-
-    def add_noise(self, images):
-        noise_mask = torch.bernoulli(
-            torch.full([images.shape[0], 1, *images.shape[2:]], self.noise_prob, device=images.device))
-        noise_value = torch.rand_like(images)
-        return noise_mask * noise_value + (1 - noise_mask) * images
 
     def compute_probabilities(self, images, result_bck, result_obj):
         def compute_log_mask(logits_shp):
             log_shp = nn_func.logsigmoid(logits_shp)
             log1m_shp = log_shp - logits_shp
-            zeros = torch.ones([1, *logits_shp.shape[1:]], device=logits_shp.device)
+            zeros = torch.zeros([1, *logits_shp.shape[1:]], device=logits_shp.device)
             return torch.cat([log_shp, zeros]) + torch.cat([zeros, log1m_shp]).cumsum(0)
         def compute_raw_pixel_ll(bck, apc):
-            diff = torch.cat([apc, bck[None]]) - images[None]
-            return -0.5 * (self.normal_const + self.normal_invvar * diff.pow(2)).sum(-3, keepdim=True)
+            sq_diff = (torch.cat([apc, bck[None]]) - images[None]).pow(2)
+            return -0.5 * (self.normal_const + self.normal_invvar * sq_diff).sum(-3, keepdim=True)
         log_mask = compute_log_mask(result_obj['logits_shp'])
         raw_pixel_ll = compute_raw_pixel_ll(result_bck['bck'], result_obj['apc'])
         log_prob = log_mask + raw_pixel_ll
@@ -124,42 +110,19 @@ class Model(nn.Module):
         ones = torch.ones([1, *shp.shape[1:]], device=shp.device)
         return torch.cat([shp, ones]) * torch.cat([ones, 1 - shp]).cumprod(0)
 
-    def compute_init_obj_in(self, images, result_bck, result_obj):
-        mask = self.compute_mask(result_obj['shp'])
-        recon = (mask * torch.cat([result_obj['apc'], result_bck['bck'][None]])).sum(0)
-        return torch.cat([images, recon, mask[-1]], dim=1).detach()
-
     @staticmethod
-    def compute_upd_in(noisy_images, result_bck, result_obj, result_prob):
-        upd_bck_in = result_prob['gamma'][-1] * (noisy_images - result_bck['bck'])
-        upd_apc_in = result_prob['gamma'][:-1] * (noisy_images[None] - result_obj['apc'])
-        upd_shp_in = result_prob['gamma'][:-1] * (1 - result_obj['shp']) \
-                     - (1 - result_prob['gamma'][:-1].cumsum(0)) * result_obj['shp']
-        return upd_bck_in, upd_apc_in, upd_shp_in
+    def permute(x, indices):
+        indices_reshape = indices.reshape([*indices.shape] + [1] * (x.ndim - indices.ndim))
+        return torch.gather(x, 0, indices_reshape.expand(-1, -1, *x.shape[2:]))
 
-    def initialize_storage(self, result_obj, states_obj, sub_states_obj):
-        update_dict = self.dec_obj(sub_states_obj[0], obj_slots=1)
-        for key, val in result_obj.items():
-            result_obj[key] = torch.cat([val, update_dict[key]])
-        if states_obj is None:
-            states_obj = sub_states_obj
-        else:
-            states_obj = tuple([torch.cat([n1, n2]) for n1, n2 in zip(states_obj, sub_states_obj)])
-        return states_obj
-
-    def adjust_order(self, images, result_obj, states_obj, eps=1e-5):
-        def permute(x):
-            if x.dim() == 3:
-                indices_expand = indices
-            else:
-                indices_expand = indices[..., None, None]
-            x = torch.gather(x, 0, indices_expand.expand(-1, -1, *x.shape[2:]))
-            return x
+    def compute_indices(self, images, result_obj, eps=1e-5):
         sq_diffs = (result_obj['apc'] - images[None]).pow(2).sum(-3, keepdim=True).detach()
         visibles = result_obj['shp'].clone().detach()
         coefs = torch.ones(visibles.shape[:-2], device=visibles.device)
+        if coefs.shape[0] == 0:
+            return coefs.type(torch.long)
         indices_list = []
-        for _ in range(self.obj_slots):
+        for _ in range(coefs.shape[0]):
             vis_sq_diffs = (visibles * sq_diffs).sum([-2, -1])
             vis_areas = visibles.sum([-2, -1])
             vis_max_vals = visibles.reshape(*visibles.shape[:-2], -1).max(-1).values
@@ -170,42 +133,39 @@ class Model(nn.Module):
             vis = torch.gather(visibles, 0, indices[..., None, None].expand(-1, -1, *visibles.shape[2:]))
             visibles *= 1 - vis
             coefs.scatter_(0, indices, -1)
-        indices = torch.cat(indices_list)
+        return torch.cat(indices_list)
+
+    def adjust_order(self, images, result_obj, states_obj):
+        indices = self.compute_indices(images, result_obj)
         for key, val in result_obj.items():
-            result_obj[key] = permute(val)
+            result_obj[key] = self.permute(val, indices)
         states_obj = [n.reshape(indices.shape[0], -1, *n.shape[1:]) for n in states_obj]
-        states_obj = [permute(n) for n in states_obj]
+        states_obj = [self.permute(n, indices) for n in states_obj]
         states_obj = [n.reshape(-1, *n.shape[2:]) for n in states_obj]
         return tuple(states_obj)
 
-    def compute_step_losses(self, images, result_bck, result_obj, result_prob):
+    def compute_step_losses(self, images, result_bck, result_prob):
         # Loss ELBO
         log_prob = result_prob['log_prob']
         gamma = result_prob['gamma'].detach()
         log_gamma = result_prob['log_gamma'].detach()
-        loss_elbo = (gamma * (log_gamma - log_prob)).sum([0, *range(2, gamma.dim())])
+        loss_elbo = (gamma * (log_gamma - log_prob)).sum([0, *range(2, gamma.ndim)])
         # Loss back prior
         bck_prior = images.reshape(*images.shape[:-2], -1).median(-1).values[..., None, None]
         sq_diff = (result_bck['bck'] - bck_prior).pow(2)
-        loss_bck_prior = 0.5 * self.normal_invvar * sq_diff.sum([*range(1, sq_diff.dim())])
-        # Loss back variance
-        bck_var = result_bck['bck_res'].pow(2)
-        loss_bck_var = 0.5 * self.normal_invvar * bck_var.sum([*range(1, bck_var.dim())])
-        # Loss apc variance
-        apc_var = result_obj['apc_res'].pow(2)
-        loss_apc_var = 0.5 * self.normal_invvar * apc_var.sum([0, *range(2, apc_var.dim())])
+        loss_bck_prior = 0.5 * self.normal_invvar * sq_diff.sum([*range(1, sq_diff.ndim)])
         # Losses
-        losses = {'elbo': loss_elbo, 'bck_prior': loss_bck_prior, 'bck_var': loss_bck_var, 'apc_var': loss_apc_var}
+        losses = {'elbo': loss_elbo, 'bck_prior': loss_bck_prior}
         return losses
 
     @staticmethod
     def compute_ari(mask_true, mask_pred):
         def comb2(x):
             x = x * (x - 1)
-            if x.dim() > 1:
-                x = x.sum([*range(1, x.dim())])
+            if x.ndim > 1:
+                x = x.sum([*range(1, x.ndim)])
             return x
-        num_pixels = mask_true.sum([*range(1, mask_true.dim())])
+        num_pixels = mask_true.sum([*range(1, mask_true.ndim)])
         mask_true = mask_true.reshape(
             [mask_true.shape[0], mask_true.shape[1], 1, mask_true.shape[-2] * mask_true.shape[-1]])
         mask_pred = mask_pred.reshape(
@@ -231,10 +191,10 @@ class Model(nn.Module):
         ari_obj = self.compute_ari(labels, mask_oh_obj)
         # MSE
         sq_diff = (recon - images).pow(2)
-        mse = sq_diff.mean([*range(1, sq_diff.dim())])
+        mse = sq_diff.mean([*range(1, sq_diff.ndim)])
         # Log-likelihood
         pixel_ll = torch.logsumexp(log_prob, dim=0)
-        ll = pixel_ll.sum([*range(1, pixel_ll.dim())])
+        ll = pixel_ll.sum([*range(1, pixel_ll.ndim)])
         # Count
         pres_true = labels.reshape(*labels.shape[:-3], -1).max(-1).values
         if self.seg_bck:
@@ -276,7 +236,6 @@ class Model(nn.Module):
         color_1[..., 0, :, :] = 1
         color_1[..., 1, :, :] = 0.5
         boarder_color = pres * color_1 + (1 - pres) * color_0
-        boarder_color[:, -1] = 0
         row1 = torch.cat([convert_single(images), convert_multiple(apc)], dim=-1)
         row2 = torch.cat([convert_single(recon), convert_multiple(shp, color=boarder_color)], dim=-1)
         overview = torch.cat([row1, row2], dim=-2)
