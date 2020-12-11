@@ -53,7 +53,7 @@ class InitializerObj(nn.Module):
             hidden_list=config['init_obj_hidden'],
             in_features=config['init_upd_state'],
             out_features=None,
-            activation=nn.ELU,
+            activation='elu',
         )
         self.lstm = nn.LSTMCell(self.enc.out_features, config['state_obj_size'])
 

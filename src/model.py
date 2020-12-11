@@ -1,4 +1,8 @@
 import math
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as nn_func
@@ -13,7 +17,8 @@ class Model(nn.Module):
         self.normal_scale = config['normal_scale']
         self.normal_invvar = 1 / pow(self.normal_scale, 2)
         self.normal_const = math.log(2 * math.pi / self.normal_invvar)
-        self.seg_bck = config['seg_bck']
+        self.seg_overlap = config['seg_overlap']
+        self.summ_image_count = config['summ_image_count']
         # Neural networks
         self.init_bck = InitializerBck(config)
         self.init_obj = InitializerObj(config)
@@ -22,7 +27,7 @@ class Model(nn.Module):
         self.dec_bck = DecoderBck(config)
         self.dec_obj = DecoderObj(config)
 
-    def forward(self, images, labels, num_slots, num_steps, step_wt):
+    def forward(self, images, segments, overlaps, num_slots, num_steps, step_wt):
         # Initializations
         obj_slots = num_slots - 1
         states_bck = self.init_bck(images)
@@ -82,7 +87,8 @@ class Model(nn.Module):
         pres = pres_all[:, :-1]
         results = {'apc': apc_all, 'shp': shp_all, 'pres': pres_all, 'recon': recon, 'mask': mask,
                    'segment_all': segment_all, 'segment_obj': segment_obj}
-        metrics = self.compute_metrics(images, labels, pres, mask_oh_all, mask_oh_obj, recon, result_prob['log_prob'])
+        metrics = self.compute_metrics(
+            images, segments, overlaps, pres, mask_oh_all, mask_oh_obj, recon, result_prob['log_prob'])
         sum_step_wt = step_wt.sum(1)
         losses = {key: torch.stack([loss for loss in val], dim=1) for key, val in losses.items()}
         losses = {key: (step_wt * val).sum(1) / sum_step_wt for key, val in losses.items()}
@@ -185,10 +191,12 @@ class Model(nn.Module):
         score = torch.where(invalid, torch.ones_like(score), score)
         return score
 
-    def compute_metrics(self, images, labels, pres, mask_oh_all, mask_oh_obj, recon, log_prob):
+    def compute_metrics(self, images, segments, overlaps, pres, mask_oh_all, mask_oh_obj, recon, log_prob):
+        segments_obj = segments[:, :-1]
         # ARI
-        ari_all = self.compute_ari(labels, mask_oh_all)
-        ari_obj = self.compute_ari(labels, mask_oh_obj)
+        segments_obj_sel = segments_obj if self.seg_overlap else segments_obj * (1 - overlaps)[:, None]
+        ari_all = self.compute_ari(segments_obj_sel, mask_oh_all)
+        ari_obj = self.compute_ari(segments_obj_sel, mask_oh_obj)
         # MSE
         sq_diff = (recon - images).pow(2)
         mse = sq_diff.mean([*range(1, sq_diff.ndim)])
@@ -196,51 +204,55 @@ class Model(nn.Module):
         pixel_ll = torch.logsumexp(log_prob, dim=0)
         ll = pixel_ll.sum([*range(1, pixel_ll.ndim)])
         # Count
-        pres_true = labels.reshape(*labels.shape[:-3], -1).max(-1).values
-        if self.seg_bck:
-            pres_true = pres_true[:, 1:]
-        count_true = pres_true.sum(1)
+        count_true = segments_obj.reshape(*segments_obj.shape[:-3], -1).max(-1).values.sum(1)
         count_pred = pres.sum(1)
-        count_acc = (count_true == count_pred).to(dtype=torch.float)
+        count_acc = torch.eq(count_true, count_pred).to(dtype=torch.float)
         metrics = {'ari_all': ari_all, 'ari_obj': ari_obj, 'mse': mse, 'll': ll, 'count': count_acc}
         return metrics
 
-    @staticmethod
-    def compute_overview(images, results):
-        def convert_single(x_in, color=None):
-            x = nn_func.pad(x_in, [boarder_size] * 4, value=0)
-            if color is not None:
-                boarder = nn_func.pad(torch.zeros_like(x_in), [boarder_size] * 4, value=1) * color
-                x += boarder
-            x = nn_func.pad(x, [boarder_size] * 4, value=1)
-            return x
-        def convert_multiple(x, color=None):
-            batch_size, num_slots = x.shape[:2]
-            x = x.reshape(batch_size * num_slots, *x.shape[2:])
-            if color is not None:
-                color = color.reshape(batch_size * num_slots, *color.shape[2:])
-            x = convert_single(x, color=color)
-            x = x.reshape(batch_size, num_slots, *x.shape[1:])
-            x = torch.cat(torch.unbind(x, dim=1), dim=-1)
-            return x
-        boarder_size = round(min(images.shape[-2:]) / 32)
-        images = images.expand(-1, 3, -1, -1)
-        recon = results['recon'].expand(-1, 3, -1, -1)
-        apc = results['apc'].expand(-1, -1, 3, -1, -1)
-        shp = results['shp'].expand(-1, -1, 3, -1, -1)
-        pres = results['pres'][..., None, None, None].expand(-1, -1, 3, -1, -1)
-        color_0 = torch.zeros_like(pres)
-        color_1 = torch.zeros_like(pres)
-        color_0[..., 1, :, :] = 0.5
-        color_0[..., 2, :, :] = 1
-        color_1[..., 0, :, :] = 1
-        color_1[..., 1, :, :] = 0.5
-        boarder_color = pres * color_1 + (1 - pres) * color_0
-        row1 = torch.cat([convert_single(images), convert_multiple(apc)], dim=-1)
-        row2 = torch.cat([convert_single(recon), convert_multiple(shp, color=boarder_color)], dim=-1)
-        overview = torch.cat([row1, row2], dim=-2)
-        overview = nn_func.pad(overview, [boarder_size * 4] * 4, value=1)
-        overview = (overview.clamp_(0, 1) * 255).to(dtype=torch.uint8)
+    def compute_overview(self, images, results, dpi=150):
+        def convert_image(image):
+            image = (np.rollaxis(np.clip(image, 0, 1), 0, 3) * 255).astype(np.uint8)
+            if image.shape[2] == 1:
+                image = np.repeat(image, 3, axis=2)
+            return image
+        def plot_image(ax, image, xlabel=None, ylabel=None, color=None):
+            plot = ax.imshow(image, interpolation='bilinear')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_xlabel(xlabel, color='k' if color is None else color, fontfamily='monospace') if xlabel else None
+            ax.set_ylabel(ylabel, color='k' if color is None else color, fontfamily='monospace') if ylabel else None
+            ax.xaxis.set_label_position('top')
+            return plot
+        def get_overview(fig_idx):
+            image = image_batch[fig_idx]
+            recon = recon_batch[fig_idx]
+            apc = apc_batch[fig_idx]
+            shp = shp_batch[fig_idx]
+            pres = pres_batch[fig_idx]
+            rows, cols = 2, apc.shape[0] + 1
+            fig, axes = plt.subplots(rows, cols, figsize=(cols, rows + 0.2), dpi=dpi)
+            plot_image(axes[0, 0], convert_image(image), xlabel='scene')
+            plot_image(axes[1, 0], convert_image(recon))
+            for idx in range(apc.shape[0]):
+                xlabel = 'obj_{}'.format(idx) if idx < apc.shape[0] - 1 else 'back'
+                color = [1.0, 0.5, 0.0] if pres[idx] else [0.0, 0.5, 1.0]
+                plot_image(axes[0, idx + 1], convert_image(apc[idx]), xlabel=xlabel, color=color)
+                plot_image(axes[1, idx + 1], convert_image(shp[idx]))
+            fig.tight_layout(pad=0)
+            fig.canvas.draw()
+            width, height = fig.canvas.get_width_height()
+            out = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(height, width, -1)
+            plt.close(fig)
+            return out
+        image_batch = images[:self.summ_image_count].data.cpu().numpy()
+        recon_batch = results['recon'][:self.summ_image_count].data.cpu().numpy()
+        apc_batch = results['apc'][:self.summ_image_count].data.cpu().numpy()
+        shp_batch = results['shp'][:self.summ_image_count].data.cpu().numpy()
+        pres_batch = results['pres'][:self.summ_image_count].data.cpu().numpy()
+        overview_list = [get_overview(idx) for idx in range(self.summ_image_count)]
+        overview = np.concatenate(overview_list, axis=0)
+        overview = np.rollaxis(overview, 2, 0)
         return overview
 
 
