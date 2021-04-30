@@ -1,8 +1,4 @@
 import math
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as nn_func
@@ -18,7 +14,6 @@ class Model(nn.Module):
         self.normal_invvar = 1 / pow(self.normal_scale, 2)
         self.normal_const = math.log(2 * math.pi / self.normal_invvar)
         self.seg_overlap = config['seg_overlap']
-        self.summ_image_count = config['summ_image_count']
         # Neural networks
         self.init_bck = InitializerBck(config)
         self.init_obj = InitializerObj(config)
@@ -27,7 +22,16 @@ class Model(nn.Module):
         self.dec_bck = DecoderBck(config)
         self.dec_obj = DecoderObj(config)
 
-    def forward(self, images, segments, overlaps, num_slots, num_steps, step_wt):
+    def forward(self, data, phase_param, require_extra=True):
+        num_slots = phase_param['num_slots']
+        num_steps = phase_param['num_steps']
+        step_wt = self.get_step_wt(phase_param)
+        data = {key: val.cuda(non_blocking=True) for key, val in data.items()}
+        images = data['image'].float() / 255
+        segments = data['segment'][:, None, None].long()
+        scatter_shape = [segments.shape[0], segments.max() + 1, *segments.shape[2:]]
+        segments = torch.zeros(scatter_shape, device=segments.device).scatter_(1, segments, 1)
+        overlaps = torch.gt(data['overlap'][:, None, None], 1).float()
         # Initializations
         obj_slots = num_slots - 1
         states_bck = self.init_bck(images)
@@ -74,26 +78,40 @@ class Model(nn.Module):
         # Outputs
         apc_all = torch.cat([result_obj['apc'], result_bck['bck'][None]]).transpose(0, 1)
         shp = result_obj['shp']
+        mask = self.compute_mask(shp)
+        segment_all = torch.argmax(mask, dim=0, keepdim=True)
+        mask_oh = torch.zeros_like(mask).scatter_(0, segment_all, 1)[:-1]
+        pres = mask_oh.reshape(*mask_oh.shape[:-3], -1).max(-1).values
+        shp *= pres[..., None, None, None]
         shp_all = torch.cat([shp, torch.ones([1, *shp.shape[1:]], device=shp.device)]).transpose(0, 1)
         mask = self.compute_mask(shp).transpose(0, 1)
         recon = (mask * apc_all).sum(1)
         segment_all = torch.argmax(mask, dim=1, keepdim=True)
         segment_obj = torch.argmax(mask[:, :-1], dim=1, keepdim=True)
-        mask_oh_all = torch.zeros_like(mask)
-        mask_oh_obj = torch.zeros_like(mask[:, :-1])
-        mask_oh_all.scatter_(1, segment_all, 1)
-        mask_oh_obj.scatter_(1, segment_obj, 1)
-        pres_all = mask_oh_all.reshape(*mask_oh_all.shape[:-3], -1).max(-1).values
+        mask_oh_all = torch.zeros_like(mask).scatter_(1, segment_all, 1)
+        mask_oh_obj = torch.zeros_like(mask[:, :-1]).scatter_(1, segment_obj, 1)
+        pres_all = torch.cat([pres, torch.ones([1, *pres.shape[1:]], device=pres.device)]).transpose(0, 1)
         pres = pres_all[:, :-1]
-        results = {'apc': apc_all, 'shp': shp_all, 'pres': pres_all, 'recon': recon, 'mask': mask,
-                   'segment_all': segment_all, 'segment_obj': segment_obj}
+        if require_extra:
+            results = {'apc': apc_all, 'shp': shp_all, 'pres': pres_all, 'recon': recon, 'mask': mask}
+            results = {key: (val.clamp(0, 1) * 255).to(torch.uint8) for key, val in results.items()}
+        else:
+            results = {}
         metrics = self.compute_metrics(
-            images, segments, overlaps, pres, mask_oh_all, mask_oh_obj, recon, result_prob['log_prob'])
-        sum_step_wt = step_wt.sum(1)
+            images, segments, overlaps, mask_oh_all, mask_oh_obj, recon, result_prob['log_prob'], pres)
         losses = {key: torch.stack([loss for loss in val], dim=1) for key, val in losses.items()}
-        losses = {key: (step_wt * val).sum(1) / sum_step_wt for key, val in losses.items()}
+        losses = {key: (step_wt * val).sum(1) for key, val in losses.items()}
         losses['compare'] = -metrics['ll']
         return results, metrics, losses
+
+    @staticmethod
+    def get_step_wt(phase_param):
+        if phase_param['step_wt'] is None:
+            step_wt = torch.ones([1, phase_param['num_steps'] + 1])
+        else:
+            step_wt = torch.tensor([phase_param['step_wt']]).reshape(1, phase_param['num_steps'] + 1)
+        step_wt /= step_wt.sum(1, keepdim=True)
+        return step_wt.cuda(non_blocking=True)
 
     def compute_probabilities(self, images, result_bck, result_obj):
         def compute_log_mask(logits_shp):
@@ -191,10 +209,10 @@ class Model(nn.Module):
         score = torch.where(invalid, torch.ones_like(score), score)
         return score
 
-    def compute_metrics(self, images, segments, overlaps, pres, mask_oh_all, mask_oh_obj, recon, log_prob):
+    def compute_metrics(self, images, segments, overlaps, mask_oh_all, mask_oh_obj, recon, log_prob, pres):
         segments_obj = segments[:, :-1]
         # ARI
-        segments_obj_sel = segments_obj if self.seg_overlap else segments_obj * (1 - overlaps)[:, None]
+        segments_obj_sel = segments_obj if self.seg_overlap else segments_obj * (1 - overlaps)
         ari_all = self.compute_ari(segments_obj_sel, mask_oh_all)
         ari_obj = self.compute_ari(segments_obj_sel, mask_oh_obj)
         # MSE
@@ -209,51 +227,6 @@ class Model(nn.Module):
         count_acc = torch.eq(count_true, count_pred).to(dtype=torch.float)
         metrics = {'ari_all': ari_all, 'ari_obj': ari_obj, 'mse': mse, 'll': ll, 'count': count_acc}
         return metrics
-
-    def compute_overview(self, images, results, dpi=150):
-        def convert_image(image):
-            image = (np.rollaxis(np.clip(image, 0, 1), 0, 3) * 255).astype(np.uint8)
-            if image.shape[2] == 1:
-                image = np.repeat(image, 3, axis=2)
-            return image
-        def plot_image(ax, image, xlabel=None, ylabel=None, color=None):
-            plot = ax.imshow(image, interpolation='bilinear')
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_xlabel(xlabel, color='k' if color is None else color, fontfamily='monospace') if xlabel else None
-            ax.set_ylabel(ylabel, color='k' if color is None else color, fontfamily='monospace') if ylabel else None
-            ax.xaxis.set_label_position('top')
-            return plot
-        def get_overview(fig_idx):
-            image = image_batch[fig_idx]
-            recon = recon_batch[fig_idx]
-            apc = apc_batch[fig_idx]
-            shp = shp_batch[fig_idx]
-            pres = pres_batch[fig_idx]
-            rows, cols = 2, apc.shape[0] + 1
-            fig, axes = plt.subplots(rows, cols, figsize=(cols, rows + 0.2), dpi=dpi)
-            plot_image(axes[0, 0], convert_image(image), xlabel='scene')
-            plot_image(axes[1, 0], convert_image(recon))
-            for idx in range(apc.shape[0]):
-                xlabel = 'obj_{}'.format(idx) if idx < apc.shape[0] - 1 else 'back'
-                color = [1.0, 0.5, 0.0] if pres[idx] else [0.0, 0.5, 1.0]
-                plot_image(axes[0, idx + 1], convert_image(apc[idx]), xlabel=xlabel, color=color)
-                plot_image(axes[1, idx + 1], convert_image(shp[idx]))
-            fig.tight_layout(pad=0)
-            fig.canvas.draw()
-            width, height = fig.canvas.get_width_height()
-            out = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(height, width, -1)
-            plt.close(fig)
-            return out
-        image_batch = images[:self.summ_image_count].data.cpu().numpy()
-        recon_batch = results['recon'][:self.summ_image_count].data.cpu().numpy()
-        apc_batch = results['apc'][:self.summ_image_count].data.cpu().numpy()
-        shp_batch = results['shp'][:self.summ_image_count].data.cpu().numpy()
-        pres_batch = results['pres'][:self.summ_image_count].data.cpu().numpy()
-        overview_list = [get_overview(idx) for idx in range(self.summ_image_count)]
-        overview = np.concatenate(overview_list, axis=0)
-        overview = np.rollaxis(overview, 2, 0)
-        return overview
 
 
 def get_model(config):

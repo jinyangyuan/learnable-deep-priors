@@ -3,23 +3,24 @@ import numpy as np
 
 
 def generate_images(objects):
-    images = objects[:, 0, :-1]
-    for idx in range(1, objects.shape[1]):
-        masks = objects[:, idx, -1:]
-        images = images * (1 - masks) + objects[:, idx, :-1] * masks
+    images = objects[:, -1, ..., :-1]
+    for offset in range(1, objects.shape[1]):
+        idx = objects.shape[1] - offset - 1
+        masks = objects[:, idx, ..., -1:]
+        images = images * (1 - masks) + objects[:, idx, ..., :-1] * masks
     images = (images * 255).astype(np.uint8)
     return images
 
 
 def generate_labels(objects, th=0.5):
-    masks_rev = objects[:, ::-1, -1]
+    masks = objects[..., -1]
     part_cumprod = np.concatenate([
-        np.ones((masks_rev.shape[0], 1, *masks_rev.shape[2:]), dtype=masks_rev.dtype),
-        np.cumprod(1 - masks_rev[:, :-1], 1),
+        np.ones((masks.shape[0], 1, *masks.shape[2:]), dtype=masks.dtype),
+        np.cumprod(1 - masks[:, :-1], axis=1),
     ], axis=1)
-    coef = (masks_rev * part_cumprod)[:, ::-1]
-    segments = np.argmax(coef, 1).astype(np.uint8)
-    overlaps = ((masks_rev >= th).sum(1) - 1).astype(np.uint8)
+    coef = masks * part_cumprod
+    segments = np.argmax(coef, axis=1).astype(np.uint8)
+    overlaps = ((masks >= th).sum(1) - 1).astype(np.uint8)
     labels = {'segment': segments, 'overlap': overlaps}
     return labels
 
